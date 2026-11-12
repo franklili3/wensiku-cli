@@ -11,9 +11,11 @@
   4. 引文核验（逐字比对金句库、每人至多一句）在本机完成
 
 用法：
-  ZHIPU_API_KEY=sk-xxx ./wensiku.py 复盘.txt --code WSK-XXXXXX
-  ./wensiku.py bp.md --code WSK-XXXXXX --mentors pg,altman --focus '重点看风险'
+  ZHIPU_API_KEY=sk-xxx ./wensiku.py 复盘.txt --code WSK-XXXXXX        # 智谱（默认自动探测）
+  OPENAI_API_KEY=sk-xxx ./wensiku.py bp.md --code WSK-XXX -m pg,altman  # OpenAI
+  DEEPSEEK_API_KEY=sk-xxx ./wensiku.py 报告.txt --code WSK-XXX          # DeepSeek
   ./wensiku.py 合同.pdf --raw                # 只解析不生成（零外发）
+  ./wensiku.py x.md --provider ollama --model qwen3:32b --code WSK-XXX  # 本地模型零外发
 依赖：Python 3.10+，纯标准库；PDF 需 pip install pypdf（可选）
 """
 import argparse
@@ -41,7 +43,34 @@ FILE_EXTS = {'.txt', '.md', '.csv', '.json', '.log', '.pdf'}
 DEFAULT_API = 'https://aiprep.com.cn/wensiku/api'
 DEFAULT_REVIEW_Q = ('请评审我上传的这份文件：概括其核心观点，指出亮点与主要风险/漏洞，'
                     '并结合你自己的方法论给出具体的改进建议')
-GLM_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+# ── 多厂商适配（统一走 OpenAI 兼容 chat/completions；均可 --model/--base-url 覆盖）──
+PROVIDERS = {
+    'glm':      {'base': 'https://open.bigmodel.cn/api/paas/v4',                 'model': 'glm-4.6',          'key_env': ('ZHIPU_API_KEY',)},
+    'openai':   {'base': 'https://api.openai.com/v1',                            'model': 'gpt-4o',           'key_env': ('OPENAI_API_KEY',)},
+    'claude':   {'base': 'https://api.anthropic.com/v1',                         'model': 'claude-sonnet-4-5','key_env': ('ANTHROPIC_API_KEY',)},
+    'qwen':     {'base': 'https://dashscope.aliyuncs.com/compatible-mode/v1',    'model': 'qwen-max',         'key_env': ('DASHSCOPE_API_KEY', 'ALIYUN_BAILIAN_API_KEY')},
+    'deepseek': {'base': 'https://api.deepseek.com',                             'model': 'deepseek-chat',    'key_env': ('DEEPSEEK_API_KEY',)},
+    'kimi':     {'base': 'https://api.moonshot.cn/v1',                           'model': 'kimi-k2-turbo-preview', 'key_env': ('MOONSHOT_API_KEY',)},
+    'ollama':   {'base': 'http://127.0.0.1:11434/v1',                            'model': 'qwen3:8b',         'key_env': ()},   # 本地，无需 key
+}
+
+
+def resolve_provider(name=None, base_url=None, model=None):
+    """解析 (chat_url, model, key, label)。未指定厂商时按环境变量自动探测。"""
+    if not name:
+        for p, cfg in PROVIDERS.items():
+            if any(os.environ.get(k) for k in cfg['key_env']):
+                name = p
+                break
+        if not name:
+            name = 'glm'
+    cfg = dict(PROVIDERS.get(name) or {'base': '', 'model': '', 'key_env': ()})
+    base = base_url or os.environ.get('WENSIKU_BASE_URL') or cfg['base']
+    mdl = model or os.environ.get('WENSIKU_MODEL') or cfg['model']
+    key = next((os.environ.get(k) for k in cfg['key_env'] if os.environ.get(k)), '')
+    if not key and cfg['key_env']:
+        pass   # 留给调用方给友好报错
+    return base.rstrip('/') + '/chat/completions', mdl, key, name
 
 
 def extract_file_text(name, path):
@@ -116,16 +145,22 @@ def overquoted(text):
     return sum(max(0, c - 1) for c in counts.values())
 
 
-def generate_verified(system, user_msg, quotes, label):
-    """生成 + 引文核验，违规带意见重写一次（与问思库网页版同款纪律）"""
-    key = os.environ.get('ZHIPU_API_KEY', '')
-    if not key:
-        sys.exit('✗ 缺 ZHIPU_API_KEY 环境变量（在智谱开放平台创建，仅在本机使用）')
+def generate_verified(system, user_msg, quotes, label, chat_url, model, key, label_provider):
+    """生成 + 引文核验，违规带意见重写一次（与问思库网页版同款纪律，模型厂商无关）"""
+    need_key = chat_url not in (PROVIDERS['ollama']['base'].rstrip('/') + '/chat/completions',)
+    if need_key and not key:
+        sys.exit(f'✗ 缺 API key：请设置 {label_provider} 对应的环境变量（见 README 厂商表）')
+    headers = {'Authorization': 'Bearer ' + key} if key else {}
+
+    def call(msgs):
+        body = {'model': model, 'messages': msgs, 'max_tokens': 8192}
+        if label_provider == 'glm':          # 智谱系模型的思考开关，其他厂商不加防 400
+            body['thinking'] = {'type': 'disabled'}
+        return _post(chat_url, body, headers)['choices'][0]['message']['content']
+
     msgs = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user_msg}]
     best = None
-    answer = _post(GLM_URL, {'model': 'glm-4.6', 'messages': msgs, 'max_tokens': 8192,
-                            'thinking': {'type': 'disabled'}},
-                   {'Authorization': 'Bearer ' + key})['choices'][0]['message']['content']
+    answer = call(msgs)
     for corrected in (False, True):
         over, src_ok = overquoted(answer), quote_source_ok(answer, quotes)
         if not over and src_ok:
@@ -143,9 +178,7 @@ def generate_verified(system, user_msg, quotes, label):
                  {'role': 'user', 'content': '自查未通过：' + '；'.join(issues)
                   + '。请重写整篇回答：逐字引文只能从【已核验金句库】中逐字选用'
                     f'（含自带译文与出处），{label}至多一句，其余改为第三人称转述。'}]
-        answer = _post(GLM_URL, {'model': 'glm-4.6', 'messages': msgs, 'max_tokens': 8192,
-                                'thinking': {'type': 'disabled'}},
-                       {'Authorization': 'Bearer ' + key})['choices'][0]['message']['content']
+        answer = call(msgs)
     return answer
 
 
@@ -195,6 +228,10 @@ def main():
     ap.add_argument('-m', '--mentors', default='munger', help='导师 key 逗号分隔，默认 munger；多个=圆桌')
     ap.add_argument('-f', '--focus', default='', help='评审侧重/附言（默认通用评审指令）')
     ap.add_argument('--api-url', default=os.environ.get('WENSIKU_API', DEFAULT_API))
+    ap.add_argument('--provider', default=os.environ.get('WENSIKU_PROVIDER'),
+                    help='模型厂商：glm/openai/claude/qwen/deepseek/kimi/ollama（默认按环境变量自动探测）')
+    ap.add_argument('--model', help='覆盖该厂商默认模型，如 gpt-4o-mini / qwen3:32b')
+    ap.add_argument('--base-url', help='自定义/自托管 OpenAI 兼容端点，如 http://127.0.0.1:8000/v1')
     ap.add_argument('--raw', action='store_true', help='只解析文件不生成（零外发）')
     a = ap.parse_args()
 
@@ -224,8 +261,11 @@ def main():
     user_msg = build_user_msg(q, ctx, os.path.basename(a.file), text)
     system = ctx['roundtable_prompt'] if ctx['roundtable'] else ctx['mentors'][0]['system_prompt']
     quotes = [q2 for m in ctx['mentors'] for q2 in m['quotes']]
-    print('⏳ 本机直连智谱生成 + 引文核验（约 30-120 秒）…', file=sys.stderr)
-    ans = generate_verified(system, user_msg, quotes, '每位导师' if ctx['roundtable'] else '导师')
+    chat_url, model, key, pname = resolve_provider(a.provider, a.base_url, a.model)
+    print(f'🤖 {pname} · {model} 本机直连生成 + 引文核验（约 30-120 秒）…', file=sys.stderr)
+    ans = generate_verified(system, user_msg, quotes,
+                            '每位导师' if ctx['roundtable'] else '导师',
+                            chat_url, model, key, pname)
 
     print('\n' + ans)
     print('\n── 参考来源（可核验）──', file=sys.stderr)
