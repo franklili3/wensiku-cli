@@ -53,6 +53,10 @@ export ZHIPU_API_KEY=sk-…  # 任选一家模型厂商的 key（见下表），
 - AI 生成内容仅供参考，不构成投资建议
 - 个人维护项目：issue 不保证响应，但本仓库永远保持可审计
 
+## 国内镜像
+
+GitHub 不可达时可用 Gitee 镜像：<https://gitee.com/franklili/wensiku-cli>（与 GitHub 同步推送）
+
 ## License
 
 MIT（代码）。问思库语料检索服务与导师语料库本身不开源、不随本仓库分发。
